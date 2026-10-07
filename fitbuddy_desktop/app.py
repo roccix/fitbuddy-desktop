@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import math
@@ -17,7 +18,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from . import model  # noqa: E402
+from . import foodfacts, model, scanner  # noqa: E402
 from .store import Store  # noqa: E402
 
 APP_ID = "dev.roccix.FitBuddyDesktop"
@@ -142,6 +143,12 @@ def badge(icon: str, kind: str) -> Gtk.Widget:
     holder.add_css_class("fb-badge")
     holder.add_css_class(f"fb-badge-{kind}")
     return holder
+
+
+def focus_later(widget: Gtk.Widget) -> None:
+    # grab_focus() returns True, which would make a bare idle_add(widget.grab_focus) run forever
+    # and keep stealing the focus (and reselecting the text) from every other field.
+    GLib.idle_add(lambda: widget.grab_focus() and GLib.SOURCE_REMOVE)
 
 
 def clickable(widget: Gtk.Widget, callback) -> None:
@@ -322,7 +329,11 @@ class Sheet(Adw.Dialog):
                                       propagate_natural_height=True, vexpand=True)
         self.toolbar = Adw.ToolbarView(content=scroller)
         self.toolbar.add_top_bar(header)
-        self.set_child(self.toolbar)
+        self.toasts = Adw.ToastOverlay(child=self.toolbar)
+        self.set_child(self.toasts)
+
+    def toast(self, text: str):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
 
     def actions(self, ok_label: str, on_ok):
         bar = box(False, 12, margin_start=24, margin_end=24, margin_top=8, margin_bottom=20)
@@ -332,36 +343,107 @@ class Sheet(Adw.Dialog):
 
 
 class FoodCard(Gtk.Box):
+    """One food: changing the grams rescales kcal and macros from the per-100 g rates."""
+
     def __init__(self, food: model.Food | None, on_remove, on_change):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.add_css_class("fb-subcard")
+        self.on_change = on_change
         self.servings = food.servings if food else 1.0
+        self.base = list(food.ingredients) if food else []
+        # Scaling always starts from the original food, so typing "5" on the way to "50" loses nothing.
+        self._origin = self.base
+        self._grams = food.weight if food else None
+        self._quiet = False
         head = box(False, 8)
         self.name = Field("Food", food.name if food else "", placeholder="e.g. Pasta with tomato sauce")
         head.append(self.name)
+        self.grams = Field("Grams", str(self._grams or ""), width_chars=6, numeric=True)
+        head.append(self.grams)
         trash = icon_button("fb-trash-symbolic", "Remove food", lambda: on_remove(self), "fb-danger")
         trash.set_valign(Gtk.Align.END)
         head.append(trash)
         self.append(head)
-        self.append(label("Totals for this food", "fb-dim", "fb-caption"))
+        self.hint = label("", "fb-dim", "fb-caption")
+        self.append(self.hint)
         grid = box(False, 10, homogeneous=True)
         self.kcal = Field("kcal", str(food.calories) if food else "", numeric=True)
         self.protein = Field("Protein", str(food.protein) if food else "", numeric=True)
         self.carbs = Field("Carbs", str(food.carbs) if food else "", numeric=True)
         self.fats = Field("Fats", str(food.fats) if food else "", numeric=True)
-        for field in (self.name, self.kcal, self.protein, self.carbs, self.fats):
-            field.entry.connect("changed", lambda *_: on_change())
+        self.name.entry.connect("changed", lambda *_: on_change())
+        self.grams.entry.connect("changed", lambda *_: self._grams_changed())
         for field in (self.kcal, self.protein, self.carbs, self.fats):
+            field.entry.connect("changed", lambda *_: self._totals_changed())
             grid.append(field)
         self.append(grid)
+        self._update_hint()
+
+    def _grams_value(self) -> int | None:
+        grams = parse_number(self.grams.text)
+        return model.round_half_up(grams) if grams and grams > 0 else None
+
+    def _grams_changed(self):
+        new, old = self._grams_value(), self._grams
+        if new and old and new != old:
+            if not self._origin:
+                # Totals typed by hand: they are the amount for the previous weight.
+                self._origin = [model.Ingredient.from_totals(
+                    self.name.text.strip(), old, self.kcal.number(), self.protein.number(),
+                    self.carbs.number(), self.fats.number())]
+            self.base = model.scale_ingredients(self._origin, new)
+            self.servings = 1.0
+            scaled = model.Food.of("", self.base)
+            self._quiet = True
+            for field, value in ((self.kcal, scaled.calories), (self.protein, scaled.protein),
+                                 (self.carbs, scaled.carbs), (self.fats, scaled.fats)):
+                field.text = str(value)
+            self._quiet = False
+        if new:
+            self._grams = new
+        self._update_hint()
+        self.on_change()
+
+    def _totals_changed(self):
+        if not self._quiet:
+            # Hand-edited totals win over the saved per-100 g rates.
+            self.base = self._origin = []
+            self._update_hint()
+        self.on_change()
+
+    def _update_hint(self):
+        if len(self.base) == 1 and self.base[0].weight:
+            i = self.base[0]
+            self.hint.set_label(f"Per 100 g: {model.round_half_up(i.kcal100)} kcal · " + macros_short(
+                model.round_half_up(i.protein100), model.round_half_up(i.carbs100), model.round_half_up(i.fats100)))
+        elif self.base:
+            self.hint.set_label(f"{len(self.base)} ingredients · change the grams to scale them all")
+        else:
+            self.hint.set_label("Totals for this food · with the grams set, changing them rescales the totals")
+
+    def focus_grams(self):
+        self.grams.entry.grab_focus()
+        self.grams.entry.select_region(0, -1)
 
     def totals(self) -> model.Food:
-        return model.Food(self.name.text.strip(), self.servings, round(self.kcal.number()),
-                          round(self.protein.number()), round(self.carbs.number()), round(self.fats.number()))
+        name = self.name.text.strip()
+        calories, protein = round(self.kcal.number()), round(self.protein.number())
+        carbs, fats = round(self.carbs.number()), round(self.fats.number())
+        grams = self._grams_value()
+        if self.base:
+            ingredients = self.base
+            if len(ingredients) == 1:
+                ingredients = [dataclasses.replace(ingredients[0], name=name)]
+        elif grams:
+            ingredients = [model.Ingredient.from_totals(name, grams, calories, protein, carbs, fats)]
+        else:
+            ingredients = []
+        return model.Food(name, self.servings, calories, protein, carbs, fats, ingredients)
 
 
 class MealDialog(Sheet):
-    def __init__(self, window: "MainWindow", date: str, preset: model.Preset | None = None):
+    def __init__(self, window: "MainWindow", date: str, preset: model.Preset | None = None,
+                 scan: bool = False):
         super().__init__("Build meal", width=600, height=780)
         self.window, self.date = window, date
         self.cards: list[FoodCard] = []
@@ -404,13 +486,19 @@ class MealDialog(Sheet):
         self.food_box = box(True, 14)
         self.body.append(self.food_box)
 
-        more = box(False, 12)
+        more = box(False, 12, homogeneous=True)
         more.append(pill("Add food", False, lambda: self._add(None), "fb-add-symbolic"))
+        content = box(False, 8, halign=Gtk.Align.CENTER)
+        content.append(Gtk.Image(icon_name="fb-barcode-symbolic"))
+        content.append(Gtk.Label(label="Barcode"))
+        self.barcode_btn = Gtk.MenuButton(child=content, hexpand=True, popover=self._barcode_popover())
+        self.barcode_btn.add_css_class("fb-outline")
+        more.append(self.barcode_btn)
         presets = window.view.meal_presets()
         if presets:
             content = box(False, 8, halign=Gtk.Align.CENTER)
             content.append(Gtk.Image(icon_name="fb-bookmark-symbolic"))
-            content.append(Gtk.Label(label="From saved meal"))
+            content.append(Gtk.Label(label="Saved"))
             saved = Gtk.MenuButton(child=content, hexpand=True, popover=self._preset_popover(presets))
             saved.add_css_class("fb-outline")
             more.append(saved)
@@ -418,6 +506,10 @@ class MealDialog(Sheet):
 
         for food in (preset.foods if preset else [None]):
             self._add(food)
+        if preset and len(preset.foods) == 1:
+            GLib.idle_add(self.cards[0].focus_grams)
+        if scan:
+            GLib.idle_add(self.scan)
         self.actions("Log meal", self._save)
 
     def _guess_meal_name(self) -> str:
@@ -436,11 +528,12 @@ class MealDialog(Sheet):
             listbox.append(row)
 
         def activated(_lb, row):
-            if len(self.cards) == 1 and not self.cards[0].totals().name:
-                self._remove(self.cards[0])
+            self._drop_blank()
             for food in row.preset.foods:
                 self._add(food)
             popover.popdown()
+            if len(row.preset.foods) == 1:
+                GLib.idle_add(self.cards[-1].focus_grams)
 
         listbox.connect("row-activated", activated)
         listbox.set_filter_func(lambda row: search.get_text().lower() in row.preset.name.lower())
@@ -452,13 +545,102 @@ class MealDialog(Sheet):
         popover.set_child(content)
         return popover
 
+    def _barcode_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        entry = Gtk.Entry(placeholder_text="Type the barcode", width_chars=20,
+                          input_purpose=Gtk.InputPurpose.DIGITS)
+        search = Gtk.Button(label="Find")
+        search.add_css_class("fb-primary")
+        camera = icon_button("camera-photo-symbolic", "Scan with the webcam", lambda: (popover.popdown(), self.scan()))
+        hint = label("Saved foods first, then Open Food Facts.", "fb-dim", "fb-caption", wrap=True,
+                                    max_width_chars=34)
+        row = box(False, 8)
+        for widget in (entry, search, camera):
+            row.append(widget)
+        content = box(True, 8, margin_top=10, margin_bottom=10, margin_start=10, margin_end=10)
+        content.append(row)
+        content.append(hint)
+        popover.set_child(content)
+
+        def find(*_):
+            if self._lookup(entry.get_text()):
+                entry.set_text("")
+                popover.popdown()
+
+        entry.connect("activate", find)
+        search.connect("clicked", lambda *_: find())
+        popover.connect("show", lambda *_: focus_later(entry))
+        return popover
+
+    def scan(self):
+        store = self.window.store
+        if store.config().get("camera_allowed"):
+            self._open_scanner()
+            return
+        dialog = Adw.AlertDialog(heading="Use the webcam?",
+                                 body="FitBuddy Desktop turns the camera on only while the scanner is open, "
+                                      "to read barcodes. Frames stay on this PC.")
+        dialog.add_response("cancel", "Not now")
+        dialog.add_response("allow", "Allow")
+        dialog.set_response_appearance("allow", Adw.ResponseAppearance.SUGGESTED)
+
+        def done(_d, response):
+            if response == "allow":
+                store.set_config("camera_allowed", True)
+                self._open_scanner()
+
+        dialog.connect("response", done)
+        dialog.present(self)
+
+    def _open_scanner(self):
+        store = self.window.store
+        scanner.ScannerDialog(self._lookup, preferred=store.config().get("camera"),
+                              on_camera=lambda name: store.set_config("camera", name)).present(self)
+
+    def _lookup(self, raw: str) -> bool:
+        """Adds the food for a barcode; returns False when the code is unusable."""
+        code = model.normalize_barcode(raw)
+        if len(code) < 6:
+            self.toast("Enter a valid barcode (digits only)")
+            return False
+        if saved := self.window.view.food_by_barcode(code):
+            self._found(saved)
+            return True
+        self.toast(f"Looking up {code} on Open Food Facts…")
+
+        def work():
+            try:
+                food, error = foodfacts.lookup(code), None
+            except foodfacts.ProductNotFound:
+                food, error = None, f"No nutrition data for {code}: add the food by hand"
+            except foodfacts.ServiceUnavailable:
+                food, error = None, ("Open Food Facts is busy right now: try again in a minute, "
+                                     "or enter the values by hand")
+            except (OSError, ValueError):
+                food, error = None, ("Couldn't reach Open Food Facts (offline, or blocked by a web filter): "
+                                     "enter the values by hand")
+            GLib.idle_add(lambda: self._found(food) if food else self.toast(error))
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _found(self, food: model.Food):
+        self._drop_blank()
+        self._add(food)
+        self.toast(f"Added {food.name}")
+        GLib.idle_add(self.cards[-1].focus_grams)
+
+    def _drop_blank(self):
+        if len(self.cards) == 1 and not self.cards[0].totals().name:
+            self._remove(self.cards[0])
+
     def _add(self, food: model.Food | None):
         card = FoodCard(food, self._remove, self._update)
         self.cards.append(card)
         self.food_box.append(card)
         self._update()
         if food is None:
-            GLib.idle_add(card.name.entry.grab_focus)
+            focus_later(card.name.entry)
 
     def _remove(self, card: FoodCard):
         self.cards.remove(card)
@@ -504,11 +686,14 @@ class SavedMealDialog(Sheet):
             tile.append(badge("fb-bookmark-symbolic", "meal"))
             text = box(True, 2, hexpand=True, valign=Gtk.Align.CENTER)
             text.append(label(preset.name, "fb-tile-title", ellipsize=3))
-            text.append(label(macros_short(sum(f.protein for f in preset.foods), sum(f.carbs for f in preset.foods),
-                                           sum(f.fats for f in preset.foods)), "fb-dim", "fb-caption"))
+            sub = macros_short(sum(f.protein for f in preset.foods), sum(f.carbs for f in preset.foods),
+                               sum(f.fats for f in preset.foods))
+            if len(preset.foods) == 1 and preset.foods[0].weight:
+                sub = f"{preset.foods[0].weight} g · {sub}"
+            text.append(label(sub, "fb-dim", "fb-caption"))
             tile.append(text)
             tile.append(label(f"{preset.calories} kcal", "fb-tile-value", "fb-accent"))
-            tile.append(icon_button("fb-edit-symbolic", "Edit before logging",
+            tile.append(icon_button("fb-edit-symbolic", "Change grams or edit before logging",
                                     lambda pr=preset: self._edit(pr)))
             clickable(text, lambda pr=preset: self._log(pr))
             tiles.append((preset, tile))
@@ -620,7 +805,9 @@ class LogSheet(Sheet):
         self.body.append(label(f"Pick what you're tracking · {day_title(window.date)}", "fb-dim"))
         for title, tiles in (
             ("Food", [("fb-restaurant-symbolic", "Build meal", "Multiple foods", MealDialog),
-                      ("fb-bookmark-symbolic", "Saved meal", "One tap", SavedMealDialog)]),
+                      ("fb-bookmark-symbolic", "Saved meal", "One tap", SavedMealDialog),
+                      ("fb-barcode-symbolic", "Scan barcode", "With the webcam",
+                       lambda w, d: MealDialog(w, d, scan=True))]),
             ("Activity", [("fb-fitness-symbolic", "Workout", "Gym or cardio", ExerciseDialog)]),
             ("Body", [("fb-scale-symbolic", "Weight", "Scale reading", WeightDialog)]),
         ):
@@ -1020,8 +1207,11 @@ class MainWindow(Adw.ApplicationWindow):
             foods = box(True, 6, margin_start=60)
             for food in entry.foods:
                 line = box(False, 10, "fb-food")
-                servings = f"{food.servings:g}× " if food.servings != 1 else ""
-                line.append(label(servings + food.name, hexpand=True, ellipsize=3))
+                if food.weight:
+                    amount = f"{food.weight} g · "
+                else:
+                    amount = f"{food.servings:g}× " if food.servings != 1 else ""
+                line.append(label(amount + food.name, hexpand=True, ellipsize=3))
                 line.append(label(macros_short(food.protein, food.carbs, food.fats), "fb-dim", "fb-caption"))
                 line.append(label(f"{food.calories} kcal", "fb-accent"))
                 foods.append(line)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 
 ADD_MEAL = "add_meal"
 ADD_EXERCISE = "add_exercise"
@@ -22,6 +23,53 @@ def timestamp_for(date: str, time: dt.time) -> int:
     return int(dt.datetime.combine(day, time).timestamp() * 1000)
 
 
+def round_half_up(value: float) -> int:
+    # Kotlin's roundToInt, so the PC and the phone agree on every total.
+    return math.floor(value + 0.5)
+
+
+@dataclass
+class Ingredient:
+    """Like the phone's LoggedIngredient: per-100 g rates, weight = quantity × unit weight."""
+
+    name: str
+    quantity: int
+    unit_weight: int
+    kcal100: float
+    protein100: float
+    carbs100: float
+    fats100: float
+
+    @property
+    def weight(self) -> int:
+        return self.quantity * self.unit_weight
+
+    def amount(self, per100: float) -> int:
+        return round_half_up(per100 * self.weight / 100)
+
+    @classmethod
+    def from_totals(cls, name: str, grams: int, calories: float, protein: float, carbs: float,
+                    fats: float) -> "Ingredient":
+        factor = 100 / grams if grams > 0 else 0.0
+        return cls(name, 1, grams, calories * factor, protein * factor, carbs * factor, fats * factor)
+
+
+def scale_ingredients(ingredients: list[Ingredient], grams: int) -> list[Ingredient]:
+    """Rescales a food to a new total weight, keeping the per-100 g rates."""
+    total = sum(i.weight for i in ingredients)
+    if grams <= 0 or total <= 0:
+        return ingredients
+    if len(ingredients) == 1:
+        only = ingredients[0]
+        if only.quantity > 1 and grams % only.unit_weight == 0:
+            # Counted items (e.g. eggs): 180 g of 60 g eggs is three eggs.
+            return [replace(only, quantity=grams // only.unit_weight)]
+        quantity = only.quantity if grams % only.quantity == 0 else 1
+        return [replace(only, quantity=quantity, unit_weight=grams // quantity)]
+    factor = grams / total
+    return [replace(i, unit_weight=max(1, round_half_up(i.unit_weight * factor))) for i in ingredients]
+
+
 @dataclass
 class Food:
     name: str
@@ -30,6 +78,21 @@ class Food:
     protein: int
     carbs: int
     fats: int
+    ingredients: list[Ingredient] = field(default_factory=list)
+
+    @property
+    def weight(self) -> int | None:
+        grams = sum(i.weight for i in self.ingredients)
+        return round_half_up(grams * self.servings) if grams else None
+
+    @classmethod
+    def of(cls, name: str, ingredients: list[Ingredient]) -> "Food":
+        return cls(
+            name, 1.0,
+            sum(i.amount(i.kcal100) for i in ingredients), sum(i.amount(i.protein100) for i in ingredients),
+            sum(i.amount(i.carbs100) for i in ingredients), sum(i.amount(i.fats100) for i in ingredients),
+            ingredients,
+        )
 
 
 @dataclass
@@ -239,10 +302,17 @@ class View:
                 foods = [Food(p["name"], 1.0, p["calories"], p["proteinG"], p["carbsG"], p["fatsG"])]
             presets.append((p.get("lastUsedAt", 0), Preset(p["name"], foods)))
         for f in self.snapshot.get("savedFoods", []):
-            food = Food(f["name"], 1.0, f["calories"], f["proteinG"], f["carbsG"], f["fatsG"])
-            presets.append((f.get("lastUsedAt", 0), Preset(f["name"], [food])))
+            presets.append((f.get("lastUsedAt", 0), Preset(f["name"], [_food(f)])))
         presets.sort(key=lambda item: (-item[0], item[1].name.lower()))
         return [p for _, p in presets]
+
+    def food_by_barcode(self, barcode: str) -> Food | None:
+        # UPC-A (12 digits) and its EAN-13 form differ only by a leading 0, depending on the reader.
+        code = normalize_barcode(barcode).lstrip("0")
+        for f in self.snapshot.get("savedFoods", []):
+            if code and normalize_barcode(f.get("barcode") or "").lstrip("0") == code:
+                return _food(f)
+        return None
 
     def recent_exercises(self, limit: int = 30) -> list[str]:
         names: list[str] = []
@@ -252,11 +322,27 @@ class View:
         return names[:limit]
 
 
+def normalize_barcode(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
 def _food(row: dict) -> Food:
     return Food(
         name=row["name"], servings=row.get("servings", 1.0), calories=row["calories"],
         protein=row["proteinG"], carbs=row["carbsG"], fats=row["fatsG"],
+        ingredients=[
+            Ingredient(i["name"], i["quantity"], i["unitWeightG"], i["kcalPer100"], i["proteinPer100"],
+                       i["carbsPer100"], i["fatsPer100"])
+            for i in row.get("ingredients") or []
+        ],
     )
+
+
+def _ingredient_payload(i: Ingredient) -> dict:
+    return {
+        "name": i.name, "quantity": i.quantity, "unitWeightG": i.unit_weight, "kcalPer100": i.kcal100,
+        "proteinPer100": i.protein100, "carbsPer100": i.carbs100, "fatsPer100": i.fats100,
+    }
 
 
 def meal_op_payload(name: str, timestamp: int, foods: list[Food]) -> dict:
@@ -267,6 +353,7 @@ def meal_op_payload(name: str, timestamp: int, foods: list[Food]) -> dict:
             {
                 "name": f.name, "servings": f.servings, "calories": f.calories,
                 "proteinG": f.protein, "carbsG": f.carbs, "fatsG": f.fats,
+                **({"ingredients": [_ingredient_payload(i) for i in f.ingredients]} if f.ingredients else {}),
             }
             for f in foods
         ],

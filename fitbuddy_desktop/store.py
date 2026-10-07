@@ -89,6 +89,12 @@ class Store:
                 self._write("config.json", cfg)
             return cfg
 
+    def set_config(self, key: str, value: Any) -> None:
+        with self.locked():
+            cfg = self._read("config.json", {})
+            cfg[key] = value
+            self._write("config.json", cfg)
+
     def regenerate_token(self) -> str:
         with self.locked():
             cfg = self._read("config.json", {})

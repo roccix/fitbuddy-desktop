@@ -95,3 +95,4 @@ entry.fb-field:focus-within { border: 2px solid @fb_accent; padding: 0 13px; }
 .fb-banner { background-color: #2B2412; color: #FFDFA0; border-radius: 18px; padding: 12px 16px; }
 
 viewswitcherbar actionbar, viewswitcherbar > revealer > box { background-color: #15231B; }
+.fb-camera { background-color: black; }

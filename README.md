@@ -5,6 +5,11 @@ GTK 4 and libadwaita and styled after the Android app. It shows the day's calori
 macros, log, 30-day progress and weight trend, and lets you log meals (including saved
 meals), workouts and weight from your computer. Everything stays in sync with the phone.
 
+Foods keep their per-100 g values, so a saved food can be logged at any weight: pick it,
+change the grams and kcal and macros follow. Packaged foods can also be added by barcode
+(scanned with the webcam, or typed): saved foods are checked first, then
+[Open Food Facts](https://world.openfoodfacts.org).
+
 ## How sync works
 
 - The phone stays the source of truth. On each sync, FitBuddy uploads a full snapshot of
@@ -24,10 +29,28 @@ State lives in `~/.local/share/fitbuddy-desktop/`: `config.json` (pairing code a
 
 ## Requirements
 
-Python 3.11+, PyGObject, GTK 4 and libadwaita 1.5+. On Arch-based systems such as Omarchy:
+Any recent Linux desktop, on Wayland or X11: nothing is specific to a desktop environment.
+You need Python 3.11+, PyGObject, GTK 4 and libadwaita 1.5+ (Ubuntu 24.04+, Fedora 40+,
+Arch, openSUSE Tumbleweed; Debian 12 and Ubuntu 22.04 are too old). The webcam scanner
+needs GStreamer with the `zbar` element; PipeWire is optional.
+
+Arch-based systems such as Omarchy:
 
 ```
-sudo pacman -S python-gobject gtk4 libadwaita
+sudo pacman -S python-gobject gtk4 libadwaita gst-plugins-bad zbar gst-plugin-pipewire
+```
+
+Ubuntu / Debian testing:
+
+```
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gstreamer-1.0 \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+Fedora:
+
+```
+sudo dnf install python3-gobject gtk4 libadwaita gstreamer1-plugins-good gstreamer1-plugins-bad-free-extras
 ```
 
 ## Install
@@ -36,8 +59,11 @@ sudo pacman -S python-gobject gtk4 libadwaita
 ./install.sh
 ```
 
-This installs the icon, the launcher entry and the user service; no root is needed. If you
-use ufw, open the port on the Tailscale interface once:
+This installs the icon, the launcher entry and the user service; no root is needed. It
+records the `python3` found on `PATH`, so run it with the system Python (the one with
+PyGObject), not a pyenv/mise one without it: `PATH=/usr/bin:$PATH ./install.sh`. Sync runs
+as a systemd user service; without systemd, start `python -m fitbuddy_desktop serve`
+another way. If you use ufw, open the port on the Tailscale interface once:
 
 ```
 sudo ufw allow in on tailscale0 to any port 8765 proto tcp
